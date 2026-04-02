@@ -1,0 +1,723 @@
+-- 拿20260205做的新版首页实验为例(实验组：实验组_暖色调)
+--1）参数说明（你可以直接写死或用调度变量）
+--上线日：T0 = '20260205'
+--窗口：[T0-14, T0+14] => 20260122 ~ 20260219
+--分区 dt 为 YYYYMMDD
+-- 2）SQL：抽 router 样本（一行一个 router）+ post_flag + 预设问题set
+CREATE TABLE IF NOT EXISTS tmp_${bizdate}_adm_router_user_features_0317
+LIFECYCLE 30 AS
+-- WITH params AS
+-- (
+--     SELECT  '${bizdate}'   AS dt
+--             ,'${dt_start}' AS dt_start -- T0-14
+--             ,'${dt_end}'   AS dt_end -- T0+14
+-- )
+-- ,
+-- A) eligible(候选流量池) + anchor：定义“进入触发链路”的事件，并取每个router最早一条作为anchor
+WITH anchor_event AS
+(
+    SELECT  *
+    FROM    (
+                SELECT  *
+                FROM    (
+                            SELECT  t0.router_id
+                                    ,t0.user_id
+                                    ,t0.is_enter_man
+                                    ,t0.log_time
+                                    ,t0.dt
+                                    ,t0.scene_code
+                                    ,t1.spm_b_name
+                                    ,t1.spm_c_name
+                                    ,t1.spm_d_name
+                                    ,t1.spm_clean
+                                    ,t1.capability_name
+                                    ,t1.platform
+                                    ,t1.alipay_version -- 系统版本号
+                                    ,t1.phone_platform -- 手机设备型号
+                                    ,t1.language -- app语言
+                                    ,t1.network_type -- 网络类型
+                                    ,t1.interactive_mode -- 初始化模块
+                                    ,CASE
+                                            WHEN t2.router_id IS NOT NULL THEN 1
+                                            ELSE 0
+                                    END                                                                                                  AS is_caiwen -- 是否会话前曝光猜问
+                                    ,t2.preset_question_list -- 入口预设问题list，猜你想问曝光问题
+                                    ,SPLIT_PART(t2.preset_question_list, '||', 1)                                                        AS preset_question_1
+                                    ,SPLIT_PART(t2.preset_question_list, '||', 2)                                                        AS preset_question_2
+                                    ,SPLIT_PART(t2.preset_question_list, '||', 3)                                                        AS preset_question_3
+                                    ,SPLIT_PART(t2.preset_question_list, '||', 4)                                                        AS preset_question_4
+                                    ,ROW_NUMBER() OVER (PARTITION BY t0.router_id ORDER BY DATEDIFF(t0.log_time, t2.log_time, 'ss') ASC) AS rn_2 -- 取“最接近会话最近一次的曝光”
+                            FROM    (
+                                        SELECT  *
+                                        FROM    (
+                                                    SELECT  *
+                                                            ,ROW_NUMBER() OVER (PARTITION BY router_id ORDER BY log_time ASC) AS rn
+                                                    FROM    zfcdm_cc.dws_crm_mypa_service_exploded_di
+                                                    WHERE   dt >= '${dt_start}'
+                                                    AND     dt <= '${dt_end}'
+                                                    AND     channel NOT IN ('FAQ')
+                                                    AND     user_id != '2088' -- 剔除匿名用户
+                                                )
+                                        WHERE   rn = 1
+                                    ) t0
+                            JOIN    (
+                                        SELECT  *
+                                                ,REGEXP_EXTRACT(spm, '_(\\d+)$', 1)             AS spm_code -- 点位
+                                                ,KEYVALUE(exinfo4, '^', '=', 'alipayVersion')   AS alipay_version -- 系统版本号
+                                                ,KEYVALUE(exinfo4, '^', '=', 'platform')        AS phone_platform -- 手机设备型号
+                                                ,KEYVALUE(exinfo4, '^', '=', 'language')        AS language -- app语言
+                                                ,KEYVALUE(exinfo4, '^', '=', 'networkType')     AS network_type -- 网络类型
+                                                ,KEYVALUE(exinfo4, '^', '=', 'interactiveMode') AS interactive_mode -- 初始化模块
+                                        FROM    (
+                                                    SELECT  *
+                                                    FROM    zfcdm_cc.dwd_crm_mypa_service_detail_di
+                                                    WHERE   dt >= '${dt_start}'
+                                                    AND     dt <= '${dt_end}'
+                                                    AND     exinfo4 IS NOT NULL
+                                                )
+                                    ) t1
+                            ON      t0.router_id = t1.router_id
+                            AND     t0.dt = t1.dt
+                            AND     t0.log_time = t1.log_time
+                            JOIN    (
+                                        SELECT  router_id
+                                                ,log_time
+                                                ,dt
+                                                ,WM_CONCAT('||', ob_name) WITHIN GROUP(ORDER BY spm_code ASC) AS preset_question_list -- 入口预设问题list，猜你想问曝光问题
+                                        FROM    (
+                                                    SELECT  *
+                                                            ,REGEXP_EXTRACT(spm, '_(\\d+)$', 1)    AS spm_code -- 点位
+                                                            ,KEYVALUE(exinfo4, '^', '=', 'obName') AS ob_name -- 中间组件名称
+                                                    FROM    zfcdm_cc.dwd_crm_mypa_service_detail_di
+                                                    WHERE   dt >= '${dt_start}'
+                                                    AND     dt <= '${dt_end}'
+                                                    AND     exinfo4 IS NOT NULL
+                                                    AND     behaviorid = 'exposure'
+                                                    AND     spm_c_name = '猜你想问'
+                                                    ORDER BY REGEXP_EXTRACT(spm, '_(\\d+)$', 1) ASC
+                                                )
+                                        GROUP BY router_id
+                                                ,log_time
+                                                ,dt
+                                    ) t2
+                            ON      t0.router_id = t2.router_id
+                            AND     t0.dt = t2.dt
+                            AND     DATEDIFF(t0.log_time, t2.log_time, 'ss') BETWEEN 0 AND 300 -- 取对话前猜你想问曝光问题，限定5min前
+                        )
+                WHERE   rn_2 = 1
+            ) t
+    WHERE   scene_code IN (
+                              'app_yebzzjk',
+                              'app_yeb_a',
+                              'app_yebzrzcjygzjk',
+                              'app_yeb_detail',
+                              'app_yebdjjk_ptzc',
+                              'app_fund_zhth',
+                              'app_fund_bonus',
+                              'app_yebdjjk_myxy',
+                              'app_yeb_plus',
+                              'app_gryljktyjk',
+                              'app_yeb_bzbh',
+                              'app_yebdjjk_52zz',
+                              'app_bbz_kkqd',
+                              'app_yebdszr',
+                              'app_finance_analyse',
+                              'app_gold',
+                              'app_gold_income',
+                              'app_yebdezrjk',
+                              'app_mywish_zffssz',
+                              'app_yebckk_kty',
+                              'app_yebkszcjk',
+                              'app_mywish_zjqc',
+                              'app_lc_lhqy',
+                              'app_yesjyeb_jgy',
+                              'app_gold_profit',
+                              'app_gryljktcgyjk',
+                              'app_gold_hjp',
+                              'app_yeb_gzlc',
+                              'app_yeb_hdgjkyje',
+                              'app_yebdjjk_xycx',
+                              'app_yebdjjk_hdgj',
+                              'app_cfzxb',
+                              'app_yeb_rules_faq',
+                              'app_totalfund_risktest',
+                              'app_financialscore',
+                              'app_stock_level2',
+                              'app_yebzczmy',
+                              'app_stocktool',
+                              'app_stock_hd',
+                              'app_gold_invoices',
+                              'app_stock_hot',
+                              'app_yebzrsj_yhkym',
+                              'app_yeb_syj',
+                              'app_fund_zhwc',
+                              'app_stock_qingyubiao',
+                              'app_stock_remen',
+                              'app_totalprofit',
+                              'app_gold_exchange',
+                              'app_fund_syylzdzry',
+                              'app_fund_mubiaotou4',
+                              'app_fund_yljzhzry',
+                              'app_private_equity',
+                              'app_fund_upgrade',
+                              'app_lczb',
+                              'app_yeb_bbqn',
+                              'app_fund',
+                              'app_yeb_push',
+                              'ant_fortune_notice',
+                              'app_fund_syylkhy',
+                              'app_smileaip',
+                              'app_fund_zuhe',
+                              'mbill_tips',
+                              'app_tab3_ksphb',
+                              'app_alipayhuishenghuo',
+                              'app_zmxy_xyshxq',
+                              'app_bthhqfdxcx',
+                              'app_chuxing_help',
+                              'app_dzsbk_sybz',
+                              'app_huiyuandengjisy',
+                              'app_zmxyljfy',
+                              'app_city_shebao',
+                              'app_zmxy_cnl',
+                              'app_sesamecredit',
+                              'app_shipinhongbao3.0',
+                              'app_zucheddxqy',
+                              'app_shenghuojiaofei_Pay',
+                              'app_friendslist',
+                              'app_zhengjianjia',
+                              'app_shenghuojiaofei_xcx',
+                              'app_zmxy_xyxf',
+                              'app_czfw_zc',
+                              'app_shjfxcx',
+                              'app_bthhqfdh5',
+                              'app_chengchemabc',
+                              'app_jppdsy',
+                              'app_etc_fuw',
+                              'app_zmxy_xbsygl',
+                              'app_zmxyxycz',
+                              'app_zidongchong',
+                              'app_city_gjjin',
+                              'app_xyp_xcx',
+                              'app_etc_help',
+                              'app_czzxxcx',
+                              'app_xiaochengxu_myexpress',
+                              'app_city_service',
+                              'app_carservice_new',
+                              'app_gaosuETCv3_zlxxtxy',
+                              'app_wanzhuanzfb',
+                              'app_mayibaoxian',
+                              'app_hybmzx_mzdzy',
+                              'app_insurance_INSU000100',
+                              'app_xhbsj_zzsdb',
+                              'app_cxbaodanye',
+                              'app_lipeimenhu',
+                              'app_qmbzsylj_bdy',
+                              'app_hybmzx_ddy',
+                              'app_yhkaqxbaodan',
+                              'app_wannengbao_dbbxj',
+                              'app_lp_hybzyylzx_ygc',
+                              'app_cyzd_cytb2024',
+                              'app_qmbylj2020_bdy',
+                              'app_bzjcpzdy2023',
+                              'app_mayisenlin',
+                              'app_mayinongchang_babaguoyuan',
+                              'app_mayinongchang',
+                              'app_mayisenlingzh',
+                              'app_yxzxdr',
+                              'app_nfcjuhe',
+                              'app_syypengyixiaB',
+                              'app_ecrzshouye',
+                              'app_IOTN7B',
+                              'b_yyzxsy',
+                              'app_zmxy_msc',
+                              'app_zmxy_zwpt',
+                              'app_yibaodzpzkxq',
+                              'app_quanbao',
+                              'app_paytogether_zhgl',
+                              'app_shenfenrenzheng_new',
+                              'app_dltzhzh',
+                              'app_zhyey',
+                              'app_szmxsy',
+                              'app_jingneidaikou',
+                              'app_mayihehua',
+                              'app_zzdwx_fsf',
+                              'app_barcode_pay',
+                              'app_bill_list',
+                              'app_dongjiejine_detail',
+                              'app_zzbiaodan',
+                              'app_txsfgz',
+                              'app_msfwx_cnhk_scnj',
+                              'app_unbind_card',
+                              'app_zgdlsfrz',
+                              'app_sjsmznsb_bangdinghou',
+                              'app_saoyisao',
+                              'app_xhbzl',
+                              'app_zhuanzhangdaokabiaodanye',
+                              'app_chongzhimima',
+                              'app_jym',
+                              'campus_card',
+                              'app_newfacesetting',
+                              'app_qinmifusy',
+                              'app_xiaohu_gkh',
+                              'app_youxiangdlm',
+                              'app_sjsmznsb_bangding',
+                              'app_qinmihao',
+                              'app_cmxsyzhyy',
+                              'app_hongbao_xcx',
+                              'app_sfzsc_qtsfz',
+                              'app_huabei_pdsj',
+                              'app_huabeibuzhunru',
+                              'app_huabei_bzzx',
+                              'app_hb_edguanli',
+                              'app_hb_bill',
+                              'app_hb_nextbill',
+                              'app_hbqcb',
+                              'app_moonlight_nextbill',
+                              'app_moonlight_limit',
+                              'app_huabei_hkgb',
+                              'app_moonlight_bill',
+                              'app_hbljkksx',
+                              'app_huabei_withdraw',
+                              'app_huabei_withdrawcantuse',
+                              'app_huabeixueshengzizheng',
+                              'app_hb_eddetail',
+                              'app_hbbillrecord',
+                              'app_edkuaichong',
+                              'app_hbdlqyy',
+                              'app_huabeifqmx',
+                              'app_moonlight_unbill',
+                              'app_hb_edchange',
+                              'app_hbqcjzzte',
+                              'app_hbszzzhkfs',
+                              'app_hbczrgg',
+                              'app_huabeitybsy',
+                              'app_huabei_syyh',
+                              'app_hbfq',
+                              'app_huabei_jyfqlb',
+                              'app_hbgby',
+                              'app_huabei_withdrawinfo',
+                              'app_huabeifenqiss',
+                              'app_hbhreport',
+                              'app_huabei_dzhzh',
+                              'app_jiebei_byj',
+                              'app_hbedquan',
+                              'app_hbqbyhk',
+                              'app_hb_yyzdfq',
+                              'app_huabei_duozhanghusj',
+                              'app_huabei_xrqy',
+                              'app_huabeisxf',
+                              'app_yeb_out',
+                              'app_fund_bonus',
+                              'app_yeb_detail_mbill',
+                              'app_totalfund_all',
+                              'app_yebzrzcjygz',
+                              'app_totalfund_record',
+                              'app_steadyfp',
+                              'app_fund_aip',
+                              'app_fund_aipset',
+                              'app_yesjyeb_zy',
+                              'app_fund_order',
+                              'app_yuebao_zanzhe',
+                              'app_fund_cyxqy_profit',
+                              'app_yeb_new',
+                              'app_totalfund_profit',
+                              'app_advancedfp',
+                              'app_fund_profit',
+                              'app_fund_bntcc',
+                              'app_lwish_mywish',
+                              'app_gold_aip1',
+                              'app_gold_details',
+                              'app_fund_sell',
+                              'app_hqlc',
+                              'app_yebckk_zrzcy',
+                              'app_yeb_dezr_bk',
+                              'app_fund_bnt_new',
+                              'app_fund_yanglao',
+                              'app_fund_yanglao3',
+                              'app_yeb_52zzq',
+                              'app_yeb_sxz',
+                              'app_steadyfp_shichang',
+                              'app_yeb_rules2',
+                              'app_yeb_ann',
+                              'app_yeb_a_new',
+                              'app_xzzqg',
+                              'app_fp_holdings',
+                              'app_yeb_rules',
+                              'app_hqlcjk',
+                              'app_banksavings1',
+                              'app_yeb_qgj',
+                              'app_zanjinzi',
+                              'app_qgj_glqgjzrjh',
+                              'app_shouyi_challenge',
+                              'app_yeb_hd2019_3',
+                              'app_yeb_dezr',
+                              'app_fund_conversion',
+                              'app_fund_bnt',
+                              'app_fund_mubiaotou3',
+                              'app_bnt_aip',
+                              'app_hqlczdzr',
+                              'app_fund_axyzq',
+                              'app_yebqj_ddy',
+                              'app_yeb_axzdc',
+                              'app_banksaving_holding',
+                              'app_moneyfund_profit',
+                              'app_licaizi_detail',
+                              'app_banksavings2',
+                              'app_r_dlgl',
+                              'app_fund_bnt_kaihu',
+                              'app_fund_yanglao2',
+                              'app_licaizi_product',
+                              'app_yeb_hdgj',
+                              'app_yebckk_cyxqy',
+                              'app_yeb_gzzr',
+                              'app_yebqj_tpy',
+                              'app_fund_syylzhgly',
+                              'app_grylj_xcx',
+                              'app_lrlc2',
+                              'app_fund_mubiaotou1',
+                              'app_gdlc_scy2',
+                              'app_fund_bnt_tiaocang',
+                              'app_r_service_online',
+                              'app_fund_mubiaotou2',
+                              'app_fund_industry',
+                              'app_yanglaoxian',
+                              'app_tgpt',
+                              'app_fund_yhcd',
+                              'app_banksaving_profit',
+                              'app_gdlc_cyy',
+                              'app_gdlc_rz',
+                              'app_lrlc3',
+                              'app_ysqyeb_cyy',
+                              'app_lwish_name',
+                              'app_lrlc1',
+                              'app_fund_bill',
+                              'app_dkjz_yanglaoxian',
+                              'app_liantoux',
+                              'app_yesjyeb_tp',
+                              'app_fund_dingtou',
+                              'app_yeb_out_shengji',
+                              'app_tggj_fees',
+                              'app_zcb_profit',
+                              'app_fund_wwt',
+                              'app_lcxzq_jhgl',
+                              'app_fund_detail',
+                              'app_dingqi_jgxck1',
+                              'app_shouyi_sold',
+                              'app_fund_index',
+                              'app_tzjh',
+                              'for_treasure',
+                              'app_yebdjjk',
+                              'app_licai_seed',
+                              'app_lcxzq_jhsz',
+                              'app_qslc_profit',
+                              'app_stock_stimulation',
+                              'app_dingqi_jgxck2',
+                              'app_fund_tzsfc',
+                              'app_gzzr',
+                              'app_bank_fortune',
+                              'app_xbjbsycjwt',
+                              'app_jiebei_bzr',
+                              'app_jieqian',
+                              'app_jbhqxg',
+                              'app_jiebei_ed',
+                              'app_jiebei_jkxq',
+                              'app_jbjqxg',
+                              'app_jiebei_wdjb',
+                              'app_jb_yhsxyxq',
+                              'app_jb_qtbzry',
+                              'app_xyk_huankuan',
+                              'app_jiebei_jqzm',
+                              'app_jb_tqhk',
+                              'app_xinyongka_mybzxyk'
+                          )
+-- eligible触发事件1：实验入口限定
+-- AND     is_caiwen = 1 -- eligible触发事件2：会话前曝光猜问（前置条件）
+)
+-- B)去重，保证一个router一行数据
+,router_base AS
+(
+    SELECT  router_id
+            ,user_id
+            ,is_enter_man
+            ,log_time   AS router_start_time
+            ,dt
+            ,scene_code
+            ,spm_clean  AS anchor_spm_clean
+            ,spm_b_name AS anchor_spm_b_name
+            ,spm_c_name AS anchor_spm_c_name
+            ,spm_d_name AS anchor_spm_d_name
+            ,capability_name
+            ,platform
+            ,alipay_version
+            ,phone_platform
+            ,language
+            ,network_type
+            ,interactive_mode
+            ,preset_question_list
+            ,preset_question_1
+            ,preset_question_2
+            ,preset_question_3
+            ,preset_question_4
+            ,1          AS eligible
+    FROM    (
+                SELECT  a.*
+                        ,ROW_NUMBER() OVER (PARTITION BY router_id ORDER BY log_time ASC) AS rn_3
+                FROM    anchor_event a
+            ) t
+    WHERE   rn_3 = 1
+)
+,
+-- C) 命中标：router级 hit_flag（用你的真实表替换）
+hit AS
+(
+    SELECT  t.*
+            ,1 AS hit_flag
+    FROM    (
+                SELECT  a.is_whitelist
+                        ,b.*
+                FROM    (
+                            SELECT  *
+                            FROM    (
+                                        SELECT  '前端'                                                              AS exp_type
+                                                ,experiment_id -- 实验id
+                                                ,experiment_name --核心信息：实验名
+                                                ,experiment_version_id --核心信息：实验版本id
+                                                ,experiment_version_name --核心信息：实验版本名称
+                                                ,user_id --用户id
+                                                ,dt --分区
+                                                ,experiment_status -- 实验状态  0:创建中,1:运行中,2:已下线,3:已删除,4:预发运行中,5:灰度验证,6:已推全,7:推全中
+                                                ,DATEDIFF(gmt_create, experiment_start_time, 'dd')                  AS exp_days -- 实验运行时长（从创建时期到t+1）
+                                                ,router_id
+                                                ,is_whitelist
+                                                ,ROW_NUMBER() OVER (PARTITION BY router_id ORDER BY gmt_create ASC) AS rn
+                                        FROM    zfcdm_cc.dwd_crm_supp_darwin_exec_log_front_di -- 前端曝光实验
+                                        WHERE   dt >= '${dt_start}'
+                                        AND     dt <= '${dt_end}'
+                                        AND     experiment_status NOT IN ('已删除', '3') -- 剔除已删除实验
+                                        AND     experiment_name NOT RLIKE '测试' -- 剔除测试实验
+                                        AND     experiment_id = '334200626'
+                                        AND     experiment_version_name = '实验组_暖色调'
+                                    )
+                            WHERE   rn = 1
+                        ) a
+                JOIN    (
+                            SELECT  *
+                            FROM    (
+                                        SELECT  *
+                                                ,ROW_NUMBER() OVER (PARTITION BY router_id ORDER BY log_time ASC) AS rn
+                                        FROM    zfcdm_cc.dws_crm_mypa_service_exploded_di
+                                        WHERE   dt >= '${dt_start}'
+                                        AND     dt <= '${dt_end}'
+                                        AND     channel NOT IN ('FAQ')
+                                    )
+                            WHERE   rn = 1
+                        ) b
+                ON      a.router_id = b.router_id
+                AND     a.dt = b.dt
+            ) t
+)
+,
+-- D) 满意度问卷：router级 satis_flag（用你的真实表替换）
+survey AS
+(
+    SELECT  router_id
+            ,is_online_sat_satisfaction AS satis_flag
+    FROM    (
+                SELECT  *
+                        ,ROW_NUMBER() OVER (PARTITION BY router_id ORDER BY log_time ASC) AS rn
+                FROM    zfcdm_cc.dws_crm_mypa_service_exploded_di
+                WHERE   dt >= '${dt_start}'
+                AND     dt <= '${dt_end}'
+                AND     channel NOT IN ('FAQ')
+            )
+    WHERE   rn = 1
+)
+-- E) router汇总输出：一行一个router + post_flag + 组合特征
+,router_summary AS
+(
+    -- 策略
+    SELECT  b.router_id
+            ,b.user_id
+            ,COALESCE(SUBSTR(b.user_id, -1, 1), 'uid空')                     AS uid_last_1no -- 用户尾号倒1
+            ,COALESCE(SUBSTR(b.user_id, -2, 1), 'uid空')                     AS uid_last_2no -- 用户尾号倒2
+            ,COALESCE(SUBSTR(b.user_id, -3, 1), 'uid空')                     AS uid_last_3no -- 用户尾号倒3
+            ,b.router_start_time
+            ,b.dt
+            ,CASE
+                    WHEN b.dt >= '${bizdate}' THEN 1
+                    ELSE 0
+            END                                                              AS post_flag -- 是否实验上线日期
+            ,h.is_whitelist -- 是否白名单用户
+            -- 入口/场景
+            ,b.scene_code
+            ,t5.scene_business_name_level3
+            ,t5.scene_biz_unit_1
+            ,t5.scene_biz_unit_2
+            ,t5.scene_biz_unit_3
+            ,t5.scene_business_name_level1
+            ,t5.scene_business_name_level2
+            ,t5.scene_group
+            -- anchor spm（最早一条 eligible 事件）
+            ,b.anchor_spm_clean
+            ,b.anchor_spm_b_name
+            ,b.anchor_spm_c_name
+            ,b.anchor_spm_d_name
+            -- 组合特征,入口 * spm
+            ,CONCAT(b.scene_code, '||', COALESCE(b.anchor_spm_clean, 'NA'))  AS scene_spm_clean -- 入口*SPM信息：去掉下划线后的spm
+            ,CONCAT(b.scene_code, '||', COALESCE(b.anchor_spm_b_name, 'NA')) AS scene_spm_b_name -- 入口*SPM信息：b位名
+            ,CONCAT(b.scene_code, '||', COALESCE(b.anchor_spm_c_name, 'NA')) AS scene_spm_c_name -- 入口*SPM信息：c位名
+            ,CONCAT(b.scene_code, '||', COALESCE(b.anchor_spm_d_name, 'NA')) AS scene_spm_d_name -- 入口*SPM信息：d位名
+            -- 端环境/版本/来源（取anchor行）
+            ,b.capability_name
+            ,b.platform
+            ,b.alipay_version
+            ,b.phone_platform
+            ,b.language
+            ,b.network_type
+            ,b.interactive_mode
+            ,b.preset_question_list -- 入口预设问题list，猜你想问曝光问题
+            ,b.preset_question_1 -- 入口预设问题1
+            ,b.preset_question_2 -- 入口预设问题2
+           
+            ,b.preset_question_3 -- 入口预设问题3
+            ,b.preset_question_4 -- 入口预设问题4
+            -- 日期
+            ,t6.day_of_week -- 对话开始天段_周一到周日
+            ,t6.holiday_flag -- 是否节假日
+            ,t6.is_workday -- 是否工作日
+            ,t6.weekend_flag -- 是否周末
+            ,COALESCE(h.hit_flag, 0)                                         AS hit_flag -- 命中策略标
+            ,s.satis_flag -- 是否满意
+    FROM    router_base b
+    LEFT JOIN   hit h
+    ON      b.router_id = h.router_id
+    LEFT JOIN   survey s
+    ON      b.router_id = s.router_id
+    LEFT JOIN   (
+                    SELECT  *
+                    FROM    antcc.adm_crm_dim_bi2_scene_group_dd
+                ) t5
+    ON      b.scene_code = t5.scene_code
+    LEFT JOIN   (
+                    SELECT  cal_str
+                            ,CASE   dayofweek(TO_DATE(cal_str, 'yyyymmdd'))
+                                    WHEN 1 THEN '周一'
+                                    WHEN 2 THEN '周二'
+                                    WHEN 3 THEN '周三'
+                                    WHEN 4 THEN '周四'
+                                    WHEN 5 THEN '周五'
+                                    WHEN 6 THEN '周六'
+                                    WHEN 7 THEN '周日'
+                            END AS day_of_week -- 对话开始天段_周一到周日
+                            ,holiday_flag -- 是否节假日
+                            ,is_workday -- 是否工作日
+                            ,weekend_flag -- 是否周末
+                    FROM    antddm.adm_ddm_hy_holiday_info
+                    WHERE   dt = '${dt_end}'
+                    AND     cal_str >= '${dt_start}'
+                    AND     cal_str <= '${dt_end}'
+                ) t6
+    ON      b.dt = t6.cal_str
+    WHERE   b.eligible = 1 -- 在候选流量池内
+    AND     s.satis_flag IS NOT NULL -- 只保留有问卷的router
+)
+,
+-- F) router汇总输出 + uid对应用户特征
+router_user_summary AS
+(
+    SELECT  r.*
+            -- 用户特征（只放你需要的字段；这里示例放一部分，你可以全放）
+            ,u.zfb_account_user_age --支付宝用户年龄
+            ,u.zfb_account_user_gender --支付宝用户性别
+            ,u.zfb_user_prov_name --支付宝用户常驻省份名称
+            ,u.user_resident_city_name --支付宝用户常驻城市名称
+            ,u.zfb_user_area_name --支付宝用户常驻区县名称
+            ,u.user_resident_city_level --支付宝用户常驻城市级别
+            ,u.zfb_user_invest_amount_level --用户可投资区间
+            ,u.antmbr_current_grade --蚂蚁会员当前等级
+            ,u.forecast_occupation_std_dft --预测用户职业
+            ,u.zfb_user_education_dft --支付宝用户学历
+            ,u.zfb_account_is_froze_flag --支付宝账户是否被冻结(1=是,u.0=否)
+            ,u.zfb_account_type --支付宝用户类型(1:公司,u.2:个人,u.0:未知)
+            ,u.zfb_account_create_days --用户注册天数
+            ,u.zfb_account_enabled_status --支付宝账户激活状态(T:正常,u.B:冻结,u.W:注册未激活,u.Q:快速注册,u.C:注销)
+            ,u.user_type --用户类型(1:公司/2:个人/3:内部户/6:担保户/8:总账/99:历史脏数据)
+            ,u.user_sub_type --用户子类型(CO:公司/SINGLE:个体工商户/INST:事业单位/COMM:社会团体/NGO:民办非企业组织/STATEORGAN:党政国家机关/FIN:金融机构/SCORP:特殊单位/VIRO:虚拟主体,u.个人用户为空）
+            ,u.user_status --用户状态(T:正常/B:冻结/W:注册未激活/Q:快速注册/C:注销)
+            ,u.profession --职业
+            ,u.account_level --账户等级(L0/L1/L2/L3,u.企业没有账户等级,u.详见https://yuque.antfin-inc.com/uu8too/cyhsff/sbn6zm#RbIFS)
+            ,u.user_tag --人群分层标，具体见：https://yuque.antfin.com/docs/share/1e2b68c4-4680-4b34-bbf9-1471208e6aea?# 《用户人群分层表说明》
+            ,u.is_k12_flag --是否K12，0-否/1-是，实名， 6-17岁
+            ,u.is_daxuesheng_flag --是否大学生，0-否/1-是，实名，18岁及以上，大学生
+            ,u.is_qinzirenqun_flag --是否亲子人群，0-否/1-是，实名，本人18岁及以上，孩子年龄18岁及以下
+            ,u.is_xiaoweishangjia_flag --是否小微商家，0-否/1-是 收钱码商家
+            ,u.is_lanling_flag --是否蓝领
+            ,u.is_bailing_flag --是否白领
+            ,u.user_education --学历
+            ,u.is_realname_flag --是否实名
+            ,u.usr_actv_flag --用户活性，仅MAU有值
+            ,u.glc_tag --用户生命周期
+            ,u.salary_level --用户消费分层
+            ,u.is_dau --是否DAU用户
+            ,u.is_mau --是否MAU用户
+            ,u.is_aau --是否AAU用户
+            ,u.last_dau_dt_diff --最近一次活跃的日期间隔，0-当日活跃，N-最近活跃在N天前
+            ,u.user_login_type --用户分层标签：当月新登-近一个月新登录用户；高活复登-近3个月高活老用户且每个月登陆天数 >= 20天；中活复登-近3个月中活老用户且每个月登陆天数<20天但大于等于8天；低活复登-至少近两个月登陆天数<8天但大于等于1天
+            ,u.new_user_tag --新老用户标签
+            ,u.is_black_user --是否风控黑名单用户
+            ,u.usr_login_days_7d -- 近7天登录天数
+            ,u.usr_login_days_30d -- 近30天登录天数
+            ,u.usr_login_days_90d -- 近90天登录天数
+            ,u.zfb_login_cnt_30d -- 近30天登录次数
+            ,u.7d_router_cnt -- 近7天智能服务量
+            ,u.30d_router_cnt -- 近30天智能服务量
+            ,u.7d_enter_man_cnt -- 近7天转人工会话router量
+            ,u.30d_enter_man_cnt -- 近30天转人工会话router量
+            ,u.7d_ticket_cnt --  近7天提交工单量
+            ,u.30d_ticket_cnt --  近30天提交工单量
+            ,u.7d_is_shengtou --  近7天是否提交过升投工单
+            ,u.30d_is_shengtou --  近30天是否提交过升投工单
+            ,u.7d_is_jianguan --   近7天是否提交过监管工单
+            ,u.30d_is_jianguan --  近30天是否提交过监管工单
+            ,COALESCE(t2_agg.is_unfinished_ticket, 0)  AS is_unfinished_ticket -- 对话前该用户是否存在未完结工单
+            ,COALESCE(t2_agg.unfinished_ticket_cnt, 0) AS unfinished_ticket_cnt -- 对话前未完结工单数
+            ,t2_agg.recent_unfinished_ticket_days      AS recent_unfinished_ticket_days -- 对话前距离最近一次工单创建天数
+    FROM    router_summary r
+    -- 1) 用户画像：用 dt = bizdate - 1 的快照，上线日-1
+    LEFT JOIN   (
+                    SELECT  *
+                    FROM    antcc.adm_crm_user_tag_mypa_svc_detail
+                    WHERE   dt = TO_CHAR(DATEADD(TO_DATE('${bizdate}', 'yyyymmdd'), -1, 'dd'), 'yyyymmdd')
+                ) u
+    ON      u.user_id = r.user_id
+    -- 2) 未完结工单：先聚合到 router_id 粒度，避免 router 被打散成多行
+    LEFT JOIN   (
+                    SELECT  r2.router_id
+                            ,1 AS is_unfinished_ticket
+                            ,t2.unfinished_ticket_cnt
+                            ,t2.recent_unfinished_ticket_days
+                    FROM    router_summary r2
+                    JOIN    (
+                                -- 先在 user 粒度算“上线前快照未完结工单状态”
+                                SELECT  t.user_id
+                                        ,COUNT(1)                                                             AS unfinished_ticket_cnt
+                                        ,MIN(DATEDIFF(TO_DATE('${bizdate}', 'yyyymmdd'), t.gmt_create, 'dd')) AS recent_unfinished_ticket_days
+                                FROM    antcc.adm_evt_crm_os_wt_ticket_delay_index_extend_di t
+                                WHERE   t.dt >= TO_CHAR(DATEADD(TO_DATE('${bizdate}', 'yyyymmdd'), -90, 'dd'), 'yyyymmdd')
+                                AND     t.dt <= TO_CHAR(DATEADD(TO_DATE('${bizdate}', 'yyyymmdd'), -1, 'dd'), 'yyyymmdd') -- 只用上线前数据
+                                AND     t.user_id != '2088'
+                                AND     t.state NOT IN ('结束', '撤销')
+                                -- 关键：用“上线日00:00”作为快照时点判断是否未完结
+                                AND     t.gmt_create < TO_DATE('${bizdate}', 'yyyymmdd')
+                                AND     (
+                                            t.gmt_end IS NULL
+                                            OR      t.gmt_end >= TO_DATE('${bizdate}', 'yyyymmdd')
+                                        )
+                                GROUP BY t.user_id
+                            ) t2
+                    ON      r2.user_id = t2.user_id
+                ) t2_agg
+    ON      r.router_id = t2_agg.router_id
+)
+SELECT  *
+FROM    router_user_summary;
