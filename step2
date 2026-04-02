@@ -1,0 +1,1201 @@
+## Notebook 2：PS模型训练（CatBoost）+ 随机/网格调参 + balance/overlap/ESS/calibration 评分 + 产出 best pscore
+### Step 0：读入 Notebook1 输出的特征工程数据 & 配置
+import os, json, time, gc, math
+import numpy as np
+import pandas as pd
+
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score, log_loss, brier_score_loss
+from sklearn.calibration import calibration_curve
+
+from catboost import CatBoostClassifier, Pool
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+OUT_DIR = "/ossfs/node_65164273/workspace/causal_out_userdid"
+FEATURE_VERSION = "user_full_v1"
+
+PANEL_PATH = f"{OUT_DIR}/panel_fe.parquet"
+PRE_PATH   = f"{OUT_DIR}/user_pre_fe.parquet"
+FEAT_PATH  = f"{OUT_DIR}/feature_cols_user.json"
+
+PS_DIR = f"{OUT_DIR}/ps_userdid_{FEATURE_VERSION}"
+os.makedirs(PS_DIR, exist_ok=True)
+
+USER_ID="user_id"
+POST="post"
+TREAT="group_u"    # user-level treatment label
+PS_COL="pscore_u"
+
+RANDOM_STATE = 2026
+rng = np.random.default_rng(RANDOM_STATE)
+
+# ---- random search budget ----
+N_TRIALS_CAT = 30      
+N_BINS_ECE = 20
+
+# ---- weights ----
+ATT_CLIP = 50.0
+ATE_CLIP = 100.0
+
+# ---- trimming ----
+TRIM_Q_LOW  = 0.01
+TRIM_Q_HIGH = 0.99
+TRIM_DROP_MAX = 0.40
+
+# ---- tuning sample size（关键：不然太慢）----
+TUNE_N = 300_000       # 200k~400k 推荐；你用户量170万，300k合适
+
+# ---- cat diag onehot（用于类别SMD诊断，不入模）----
+TOPK_CAT = 30
+MAX_CAT_COLS_FOR_DIAG = 50
+### Step 1：只读 PS 训练需要的列 + 基础断言
+feature_cols = json.load(open(FEAT_PATH, "r"))
+need_cols = [USER_ID, TREAT] + feature_cols
+
+df_all = pd.read_parquet(PRE_PATH, columns=need_cols)
+df_all[USER_ID] = df_all[USER_ID].astype(str)
+df_all[TREAT] = pd.to_numeric(df_all[TREAT], errors="coerce").fillna(0).astype(int)
+
+print("user_pre df:", df_all.shape,
+      "n_users:", df_all[USER_ID].nunique(),
+      "treated_rate:", float(df_all[TREAT].mean()),
+      "n_features:", len(feature_cols))
+
+assert df_all[TREAT].sum() > 0 and (df_all[TREAT]==0).sum() > 0
+### Step2：生成特征列清单 + numeric/cat 统计
+cand = df_all[feature_cols]
+num_cols = cand.select_dtypes(include=[np.number]).columns.tolist()
+cat_cols = cand.select_dtypes(include=["object","category","string"]).columns.tolist()
+print("numeric:", len(num_cols), "cat:", len(cat_cols))
+
+with open(f"{PS_DIR}/feature_cols_{FEATURE_VERSION}.json", "w") as f:
+    json.dump(feature_cols, f, ensure_ascii=False, indent=2)
+print("saved:", f"{PS_DIR}/feature_cols_{FEATURE_VERSION}.json")
+### Step 3：构造 PS 训练数据（user-level），并抽 tune 子样本 + 分 train/val
+# --- tune 子样本（用于随机搜索）---
+df_tune = df_all.sample(n=min(TUNE_N, len(df_all)), random_state=RANDOM_STATE).copy()
+print("df_tune:", df_tune.shape, "treated_rate:", float(df_tune[TREAT].mean()))
+
+X = df_tune[feature_cols]
+y = df_tune[TREAT].astype(int).values
+
+cat_idx = [feature_cols.index(c) for c in cat_cols] if len(cat_cols)>0 else None
+
+X_tr, X_va, y_tr, y_va = train_test_split(
+    X, y, test_size=0.2, random_state=RANDOM_STATE, stratify=y
+)
+
+tr = df_tune.loc[X_tr.index].copy()
+va = df_tune.loc[X_va.index].copy()
+
+print("train:", X_tr.shape, "val:", X_va.shape, "val treated:", float(y_va.mean()))
+
+# 只建一次 Pool（for后面模型训练）
+pool_tr = Pool(X_tr, y_tr, cat_features=cat_idx)
+pool_va = Pool(X_va, y_va, cat_features=cat_idx)
+print("pool_tr/pool_va built. cat_idx_len=", 0 if cat_idx is None else len(cat_idx))
+treated_rate = float(df_all[TREAT].mean())
+print("treated_rate:", treated_rate)
+### Step 4：构造“类别 balance 诊断 one-hot”（不入模，只用于算 SMD）
+def build_topk_onehot_diag(dfX, cat_cols, topk=30, max_cols=50):
+    diag = pd.DataFrame(index=dfX.index)
+    use_cols = cat_cols[:max_cols]
+    for c in use_cols:
+        s = dfX[c].astype("string").fillna("NA")
+        top_vals = s.value_counts().head(topk).index.tolist()
+        for v in top_vals:
+            diag[f"{c}=={v}"] = (s == v).astype(np.int8)
+    return diag, use_cols
+
+diag_cat_oh, cat_cols_used = build_topk_onehot_diag(
+    va[feature_cols], cat_cols, topk=TOPK_CAT, max_cols=MAX_CAT_COLS_FOR_DIAG
+)
+print("diag onehot dims:", diag_cat_oh.shape, "from cat cols:", len(cat_cols_used))
+
+balance_num_cols = num_cols
+diag_va = diag_cat_oh
+### Step5：指标函数（calibration/overlap/balance/stability）+ 多目标评分
+D_COL = TREAT
+
+def ece_score(y, ps, n_bins=20):
+    y = np.asarray(y).astype(float)
+    ps = np.asarray(ps).astype(float)
+    bins = np.linspace(0, 1, n_bins + 1)
+    idx = np.digitize(ps, bins) - 1
+    ece = 0.0
+    for b in range(n_bins):
+        m = idx == b
+        if m.sum() == 0:
+            continue
+        ece += (m.mean()) * abs(y[m].mean() - ps[m].mean())
+    return float(ece)
+
+def overlap_stats(ps):
+    ps = np.asarray(ps, dtype=float)
+    return dict(
+        p_lt_0_01=float((ps < 0.01).mean()),
+        p_gt_0_99=float((ps > 0.99).mean()),
+        p_p01=float(np.quantile(ps, 0.01)),
+        p_p99=float(np.quantile(ps, 0.99)),
+        p_min=float(ps.min()),
+        p_max=float(ps.max()),
+    )
+
+def ess(w):
+    w = np.asarray(w, dtype=float)
+    sw = w.sum()
+    return float((sw**2) / (np.sum(w**2) + 1e-12))
+
+def ipw_att_weights(D, ps, clip=50.0):
+    D = np.asarray(D).astype(int)
+    ps = np.clip(np.asarray(ps, dtype=float), 1e-6, 1 - 1e-6)
+    w = np.where(D == 1, 1.0, ps / (1 - ps))
+    return np.minimum(w, clip)
+
+def weight_summary(w):
+    w = np.asarray(w, dtype=float)
+    qs = np.quantile(w, [0.5, 0.9, 0.95, 0.99])
+    return dict(
+        w_p50=float(qs[0]),
+        w_p90=float(qs[1]),
+        w_p95=float(qs[2]),
+        w_p99=float(qs[3]),
+        w_max=float(w.max()),
+    )
+
+def wmean(x, w):
+    x = np.asarray(x, dtype=float)
+    w = np.asarray(w, dtype=float)
+    return float(np.sum(w * x) / (np.sum(w) + 1e-12))
+
+def wvar(x, w):
+    mu = wmean(x, w)
+    x = np.asarray(x, dtype=float)
+    w = np.asarray(w, dtype=float)
+    return float(np.sum(w * (x - mu) ** 2) / (np.sum(w) + 1e-12))
+
+def smd_weighted(x, D, w):
+    x = np.asarray(x, dtype=float)
+    D = np.asarray(D).astype(int)
+    w = np.asarray(w, dtype=float)
+    m1 = D == 1
+    m0 = D == 0
+    mu1, mu0 = wmean(x[m1], w[m1]), wmean(x[m0], w[m0])
+    v1, v0 = wvar(x[m1], w[m1]), wvar(x[m0], w[m0])
+    denom = np.sqrt((v1 + v0) / 2.0) + 1e-12
+    return float((mu1 - mu0) / denom)
+
+def smd_summary_numeric(df, num_cols, D, w):
+    smds = []
+    for c in num_cols:
+        x = pd.to_numeric(df[c], errors="coerce").values
+        x = np.nan_to_num(x, nan=np.nanmedian(x))
+        smds.append(abs(smd_weighted(x, D, w)))
+    smds = np.asarray(smds, dtype=float)
+    if len(smds) == 0:
+        return dict(dim=0, mean=np.nan, p90=np.nan, max=np.nan, lt_0_1=np.nan)
+    return dict(
+        dim=int(len(smds)),
+        mean=float(np.nanmean(smds)),
+        p90=float(np.nanquantile(smds, 0.90)),
+        max=float(np.nanmax(smds)),
+        lt_0_1=float(np.nanmean(smds < 0.1)),
+    )
+
+def smd_summary_onehot(diag_oh_df, D, w):
+    smds = []
+    for c in diag_oh_df.columns:
+        x = diag_oh_df[c].values.astype(float)
+        smds.append(abs(smd_weighted(x, D, w)))
+    smds = np.asarray(smds, dtype=float)
+    if len(smds) == 0:
+        return dict(dim=0, mean=np.nan, p90=np.nan, max=np.nan, lt_0_1=np.nan)
+    return dict(
+        dim=int(len(smds)),
+        mean=float(np.nanmean(smds)),
+        p90=float(np.nanquantile(smds, 0.90)),
+        max=float(np.nanmax(smds)),
+        lt_0_1=float(np.nanmean(smds < 0.1)),
+    )
+
+def get_trim_bounds_common_support(ps, D, q_low=None, q_high=None):
+    if q_low is None:  q_low = TRIM_Q_LOW
+    if q_high is None: q_high = TRIM_Q_HIGH
+    ps = np.asarray(ps, dtype=float)
+    D  = np.asarray(D, dtype=int)
+    ps_t = ps[D == 1]
+    ps_c = ps[D == 0]
+    lo = max(np.quantile(ps_t, q_low),  np.quantile(ps_c, q_low))
+    hi = min(np.quantile(ps_t, q_high), np.quantile(ps_c, q_high))
+    return float(lo), float(hi)
+
+def apply_trimming_by_bounds(df, diag_df, ps, lo, hi):
+    ps = np.asarray(ps, dtype=float)
+    mask = (ps >= lo) & (ps <= hi)
+    return df.loc[mask].copy(), diag_df.loc[mask].copy(), ps[mask].copy(), mask
+
+def _att_metrics(df_, diag_, D_, ps_):
+    w_att = ipw_att_weights(D_, ps_, clip=ATT_CLIP)
+    ws = weight_summary(w_att)
+
+    out = {}
+    out["att_ess_treated"]  = ess(w_att[D_ == 1])
+    out["att_ess_control"]  = ess(w_att[D_ == 0])
+    out["att_w_p99"]        = ws["w_p99"]
+    out["att_w_max"]        = ws["w_max"]
+
+    bal_num = smd_summary_numeric(df_, balance_num_cols, D_, w_att)
+    out["att_num_smd_mean"] = bal_num["mean"]
+    out["att_num_smd_p90"]  = bal_num["p90"]
+    out["att_num_smd_max"]  = bal_num["max"]
+    out["att_num_smd_lt_0_1"] = bal_num["lt_0_1"]
+
+    bal_cat = smd_summary_onehot(diag_, D_, w_att)
+    out["att_cat_smd_mean"] = bal_cat["mean"]
+    out["att_cat_smd_p90"]  = bal_cat["p90"]
+    out["att_cat_smd_max"]  = bal_cat["max"]
+    out["att_cat_smd_lt_0_1"] = bal_cat["lt_0_1"]
+
+    return out
+
+def eval_trial(va_df, diag_va_df, ps_va):
+    D = va_df[D_COL].values.astype(int)
+    ps = np.clip(np.asarray(ps_va, dtype=float), 1e-6, 1 - 1e-6)
+
+    m = dict(
+        auc=float(roc_auc_score(D, ps)),
+        logloss=float(log_loss(D, ps)),
+        brier=float(brier_score_loss(D, ps)),
+        ece=float(ece_score(D, ps, n_bins=N_BINS_ECE)),
+        ps_mean=float(ps.mean()),
+        ps_p99_p01=float(np.quantile(ps, 0.99) - np.quantile(ps, 0.01)),
+    )
+
+    m.update({f"overlap_{k}": v for k, v in overlap_stats(ps).items()})
+    m.update({f"raw_{k}": v for k, v in _att_metrics(va_df, diag_va_df, D, ps).items()})
+
+    lo, hi = get_trim_bounds_common_support(ps, D, q_low=TRIM_Q_LOW, q_high=TRIM_Q_HIGH)
+    m["trim_lo"] = float(lo)
+    m["trim_hi"] = float(hi)
+
+    va_t, diag_t, ps_t, mask = apply_trimming_by_bounds(va_df, diag_va_df, ps, lo, hi)
+    D_t = va_t[D_COL].values.astype(int)
+
+    m["trim_drop_rate"] = float(1.0 - mask.mean())
+    m["trim_n"] = int(mask.sum())
+    m["trim_treated_rate"] = float(D_t.mean())
+
+    m.update({f"trim_overlap_{k}": v for k, v in overlap_stats(ps_t).items()})
+
+    if (D_t.sum() > 0) and ((D_t == 0).sum() > 0):
+        m.update({f"trim_{k}": v for k, v in _att_metrics(va_t, diag_t, D_t, ps_t).items()})
+    else:
+        for k in _att_metrics(va_df, diag_va_df, D, ps).keys():
+            m[f"trim_{k}"] = np.nan
+
+    return m
+
+def score_trial(metrics, treated_rate):
+    ps_spread = float(metrics.get("ps_p99_p01", np.nan))
+
+    # ====== 动态阈值（分层）======
+    # treated 很小的时候，p99-p01 可能就是很难大（这是现实）
+    if treated_rate < 0.005:      # <0.5%
+        ps_spread_thr = 0.0015
+    elif treated_rate < 0.02:     # 0.5%~2%（你在这里）
+        ps_spread_thr = 0.0030
+    else:
+        ps_spread_thr = max(0.005, 0.6 * treated_rate)
+
+    if (not np.isfinite(ps_spread)) or (ps_spread < ps_spread_thr):
+        return False, 1e9, f"ps_nearly_constant(ps_spread={ps_spread:.5f}<thr={ps_spread_thr:.5f})"
+
+    # ===== 以下保持你原来的 hard gate（可先不动）=====
+    if (not np.isfinite(metrics["trim_drop_rate"])) or metrics["trim_drop_rate"] > TRIM_DROP_MAX:
+        return False, 1e9, "trim_too_much_or_invalid"
+    if metrics["trim_n"] < 500:
+        return False, 1e9, "trim_n_too_small"
+    if metrics["trim_overlap_p_gt_0_99"] > 0.01:
+        return False, 1e9, "trim_overlap_high"
+    if (not np.isfinite(metrics["trim_att_ess_control"])) or metrics["trim_att_ess_control"] < 300:
+        return False, 1e9, "trim_ess_control_low"
+    if metrics["trim_att_num_smd_max"] > 0.30:
+        return False, 1e9, "trim_num_balance_bad"
+    if metrics["trim_att_cat_smd_max"] > 0.55:
+        return False, 1e9, "trim_cat_balance_very_bad"
+
+    cal = 2.0 * metrics["brier"] + 5.0 * metrics["ece"]
+    bal = (3.0 * metrics["trim_att_num_smd_max"]
+         + 1.0 * metrics["trim_att_num_smd_mean"]
+         + 1.0 * metrics["trim_att_cat_smd_p90"]
+         + 2.0 * metrics["trim_att_cat_smd_max"])
+    stab = 1500.0 / (metrics["trim_att_ess_control"] + 1e-6)
+    trim_pen = 2.0 * metrics["trim_drop_rate"]
+    return True, float(cal + bal + stab + trim_pen), "ok"
+
+### Step 6：模型训练封装 + 自动调参（只保留CatBoost）
+#### 不要 class_weights（CatBoost）去“平衡类”，否则 PS 概率语义会被扭曲
+#### 自动调参（扩大范围）
+CAT_BASE = dict(
+    loss_function="Logloss",
+    eval_metric="AUC",
+    iterations=1200,
+    early_stopping_rounds=80,
+    random_seed=RANDOM_STATE,
+    verbose=False,
+    allow_writing_files=False,
+    thread_count=-1,
+    one_hot_max_size=20,
+    max_ctr_complexity=1,
+    ctr_leaf_count_limit=1000,
+    model_size_reg=5.0,
+)
+
+def log_uniform(rng, low, high):
+    return float(np.exp(rng.uniform(np.log(low), np.log(high))))
+
+def sample_catboost_params(rng):
+    # --------- 收紧范围：更稳更平滑 ----------
+    return dict(
+        depth=int(rng.integers(4, 8)),                    # 4~7
+        learning_rate=log_uniform(rng, 0.03, 0.08),       # 0.03~0.08（收紧）
+        l2_leaf_reg=log_uniform(rng, 8.0, 60.0),          # 略收紧，避免过激
+        min_data_in_leaf=int(rng.choice([1200, 2000])),   # 只留 1200/2000（更平滑）
+        rsm=float(rng.uniform(0.75, 1.0)),
+        subsample=float(rng.uniform(0.65, 0.90)),
+        bagging_temperature=float(rng.uniform(0.0, 0.8)),
+        random_strength=float(rng.uniform(0.0, 2.0)),
+        border_count=int(rng.choice([64, 128])),
+    )
+
+def fit_predict_cat_with_pool(pool_tr, pool_va, X_va, params, base=None):
+    if base is None:
+        base = CAT_BASE
+    model = CatBoostClassifier(**base, **params)
+    model.fit(pool_tr, eval_set=pool_va)
+    ps_va = model.predict_proba(X_va)[:, 1]
+    return model, ps_va
+### Step 8：catboost模型训练（随机搜索 + 选 best）
+#### 8.1 运行 catboost，随机搜索 + score 选 best（在 tune 子样本上）
+X_va = va[feature_cols]
+
+rows = []
+for t in range(N_TRIALS_CAT):
+    t0 = time.time()
+    params = sample_catboost_params(rng)
+
+    model, ps_va = fit_predict_cat_with_pool(pool_tr, pool_va, X_va, params)
+
+    metrics = eval_trial(va, diag_va, ps_va)
+
+    ok, score, reason = score_trial(metrics, treated_rate=float(y_va.mean()))
+
+    rows.append({
+        "model_type":"cat", "trial":t, "ok":ok, "score":score, "reason":reason,
+        "params":json.dumps(params, ensure_ascii=False),
+        "fit_sec":time.time()-t0,
+        "best_iter": getattr(model, "best_iteration_", np.nan),
+        **metrics
+    })
+
+    print(f"[cat {t}] sec={time.time()-t0:.1f} best_iter={getattr(model,'best_iteration_',None)} "
+          f"ok={ok} score={score:.4f} trim_drop={metrics.get('trim_drop_rate', np.nan):.2%} "
+          f"trim_w_p99={metrics.get('trim_att_w_p99', np.nan):.3f} "
+          f"trim_w_max={metrics.get('trim_att_w_max', np.nan):.3f} "
+          f"trim_num_max={metrics.get('trim_att_num_smd_max', np.nan):.3f} "
+          f"trim_cat_max={metrics.get('trim_att_cat_smd_max', np.nan):.3f} "
+          f"trim_ess_c={metrics.get('trim_att_ess_control', np.nan):.0f} "
+          f"ps_spread={metrics.get('ps_p99_p01', np.nan):.3f} reason={reason}")
+
+tuning = pd.DataFrame(rows).sort_values(["ok","score"], ascending=[False, True])
+
+ok_df = tuning[tuning["ok"]].copy()
+if len(ok_df) > 0:
+    best_row = ok_df.iloc[0]
+else:
+    print("[WARN] no OK trials; fallback select by ps_spread then balance")
+    t2 = tuning.copy()
+    for c in ["ps_p99_p01","trim_att_num_smd_max","trim_att_cat_smd_max","trim_drop_rate"]:
+        t2[c] = pd.to_numeric(t2[c], errors="coerce")
+    t2 = t2.fillna({"ps_p99_p01":0.0, "trim_drop_rate":1.0,
+                    "trim_att_num_smd_max":9.9, "trim_att_cat_smd_max":9.9})
+    t2 = t2.sort_values(
+        ["ps_p99_p01","trim_drop_rate","trim_att_num_smd_max","trim_att_cat_smd_max"],
+        ascending=[False, True, True, True]
+    )
+    best_row = t2.iloc[0]
+
+best_params = json.loads(best_row["params"])
+print("BEST ok=", bool(best_row["ok"]),
+      "reason=", best_row["reason"],
+      "ps_spread=", float(best_row.get("ps_p99_p01", np.nan)),
+      "score=", float(best_row["score"]))
+print("BEST params:", best_params)
+#### 8.2 用 best 训练 + 统一输出指标（raw+trim）+ 画图输出目录
+# =========================
+# Step8.2: fit best model + metrics + weight sanity check  (FIXED)
+# =========================
+import os, json, time, gc
+import numpy as np
+import pandas as pd
+from catboost import CatBoostClassifier, Pool
+
+out_dir = f"{PS_DIR}/step8_catboost_final_tuneval"
+os.makedirs(out_dir, exist_ok=True)
+
+# 取最优 trial
+best_row = tuning[tuning["ok"]].iloc[0]
+best_params = json.loads(best_row["params"])
+print("BEST params:", best_params, "score:", float(best_row["score"]))
+
+y_tr = tr[TREAT].astype(int).values
+y_va = va[TREAT].astype(int).values
+
+pool_tr2 = Pool(tr[feature_cols], y_tr, cat_features=cat_idx)
+pool_va2 = Pool(va[feature_cols], y_va, cat_features=cat_idx)
+
+t0 = time.time()
+cat_model = CatBoostClassifier(**CAT_BASE, **best_params)
+cat_model.fit(pool_tr2, eval_set=pool_va2)
+train_time_sec = time.time() - t0
+
+t0 = time.time()
+ps_va = cat_model.predict_proba(va[feature_cols])[:, 1]
+pred_time_sec = time.time() - t0
+
+# 先算指标（这里会产出 trim_lo/trim_hi）
+m = eval_trial(va, diag_va, ps_va)
+m["train_time_sec"] = float(train_time_sec)
+m["pred_time_sec"]  = float(pred_time_sec)
+m["model"] = "CatBoost_best"
+m["feature_version"] = FEATURE_VERSION
+
+# ===== weight sanity check（放在 m 之后）=====
+def summarize_att_weights(D, ps, clip=ATT_CLIP):
+    D = np.asarray(D).astype(int)
+    ps = np.clip(np.asarray(ps, float), 1e-6, 1-1e-6)
+    w = np.where(D == 1, 1.0, ps / (1 - ps))
+    w = np.minimum(w, clip)
+    qs = np.quantile(w, [0, 0.5, 0.9, 0.95, 0.99, 1.0])
+    return {
+        "w_min": float(qs[0]),
+        "w_p50": float(qs[1]),
+        "w_p90": float(qs[2]),
+        "w_p95": float(qs[3]),
+        "w_p99": float(qs[4]),
+        "w_max": float(qs[5]),
+        "w_mean_control": float(w[D==0].mean()) if (D==0).any() else np.nan,
+        "w_mean_treated": float(w[D==1].mean()) if (D==1).any() else np.nan,
+    }
+
+D_val = va[TREAT].values.astype(int)
+ps_clip = np.clip(ps_va, 1e-6, 1-1e-6)
+
+print("[ATT weight summary - VAL raw]", summarize_att_weights(D_val, ps_clip, clip=ATT_CLIP))
+
+lo_va, hi_va = float(m["trim_lo"]), float(m["trim_hi"])
+mask_va = (ps_clip >= lo_va) & (ps_clip <= hi_va)
+
+print(f"[ATT weight summary - VAL trim {lo_va:.6f}~{hi_va:.6f}]",
+      summarize_att_weights(D_val[mask_va], ps_clip[mask_va], clip=ATT_CLIP))
+
+# 保存指标
+res_df = pd.DataFrame([m])
+res_df.to_csv(f"{out_dir}/metrics_catboost_best_val.csv", index=False)
+print("saved:", f"{out_dir}/metrics_catboost_best_val.csv")
+display(res_df)
+#### 8.3 配置，所有图加数值标签（bar / barh）
+# =========================
+# Step8.3: plot config + annotate helpers
+# =========================
+import numpy as np
+import matplotlib.pyplot as plt
+import math
+
+plt.rcParams.update({
+    "figure.facecolor": "white",
+    "axes.facecolor": "white",
+    "savefig.facecolor": "white",
+    "axes.grid": True,
+    "grid.alpha": 0.25,
+    "grid.linestyle": "--",
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+    "font.size": 10,
+})
+
+def annotate_bars_vertical(ax, fmt="value", value_decimals=3, pct_decimals=2, pad=3):
+    for p in ax.patches:
+        h = p.get_height()
+        if h is None or np.isnan(h):
+            continue
+        if fmt == "percent":
+            s = f"{h*100:.{pct_decimals}f}%"
+        elif fmt == "auto":
+            s = f"{h*100:.{pct_decimals}f}%" if 0 <= h <= 1 else f"{h:.{value_decimals}f}"
+        else:
+            s = f"{h:.{value_decimals}f}"
+        ax.annotate(s, (p.get_x() + p.get_width()/2, h),
+                    ha="center", va="bottom", xytext=(0, pad),
+                    textcoords="offset points", fontsize=8)
+
+def auto_ylim(values, pad_ratio=0.30, min_pad=1e-6, floor_at_zero=True):
+    v = np.asarray(values, dtype=float)
+    v = v[~np.isnan(v)]
+    if len(v) == 0:
+        return (0, 1)
+    vmin, vmax = float(v.min()), float(v.max())
+    if np.isclose(vmin, vmax):
+        pad = max(abs(vmax)*pad_ratio, min_pad)
+        lo, hi = vmin-pad, vmax+pad
+    else:
+        span = vmax - vmin
+        pad = max(span*pad_ratio, min_pad)
+        lo, hi = vmin-pad, vmax+pad
+    if floor_at_zero and lo < 0 and vmin >= 0:
+        lo = 0.0
+    return lo, hi
+#### 8.4 把 res_df 变成 “raw vs trim” 两行表（用于面板画图）
+###### 你现在做的是“PS 训练后再做 overlap trimming（common support 修剪）”，所以我们需要两套诊断口径：
+
+###### raw（未修剪）
+###### 含义：在 完整验证集 上，用 ATT 权重算出的 overlap/ESS/balance 等指标。
+###### 用途：回答“模型原始输出下，整体 overlap/balance/stability 怎么样？”
+###### trim（修剪后）
+###### 含义：先用 common support 区间 [lo, hi] 把几乎没有重叠的样本剔除，再在这个 overlap 子样本上计算同样的 overlap/ESS/balance。
+###### 用途：回答“如果我们把不具可比性的尾部人群去掉，估计会不会更可信、更稳？”
+###### 为什么这一步重要？
+###### 非实验里 positivity/overlap 不满足会让估计依赖外推（尤其 ATE 权重更敏感），导致结果不稳、方差大、结论不可解释。
+###### trimming 的作用是把 estimand 明确成：“在可比（有重叠）的人群上估计效果”，并让 balance/稳定性更可靠。
+# =========================
+# Step8.4 : build plot_df with two rows: raw vs trim
+# =========================
+row = res_df.iloc[0].to_dict()
+
+def build_raw_trim_plot_df(row_dict):
+    cols = [
+        "train_time_sec","pred_time_sec",
+        "auc","logloss","brier","ece","ps_mean","ps_p99_p01",
+        "overlap_p_lt_0_01","overlap_p_gt_0_99","overlap_p_p01","overlap_p_p99",
+        "att_ess_control","att_w_p99","att_w_max",
+        "att_num_smd_mean","att_num_smd_p90","att_num_smd_max",
+        "att_cat_smd_mean","att_cat_smd_p90","att_cat_smd_max",
+        "trim_drop_rate","trim_lo","trim_hi"
+    ]
+
+    raw = {}
+    raw["train_time_sec"] = row_dict.get("train_time_sec", np.nan)
+    raw["pred_time_sec"]  = row_dict.get("pred_time_sec", np.nan)
+    for k in ["auc","logloss","brier","ece","ps_mean","ps_p99_p01"]:
+        raw[k] = row_dict.get(k, np.nan)
+    for k in ["overlap_p_lt_0_01","overlap_p_gt_0_99","overlap_p_p01","overlap_p_p99"]:
+        raw[k] = row_dict.get(k, np.nan)
+    for k in ["att_ess_control","att_w_p99","att_w_max",
+              "att_num_smd_mean","att_num_smd_p90","att_num_smd_max",
+              "att_cat_smd_mean","att_cat_smd_p90","att_cat_smd_max"]:
+        raw[k] = row_dict.get("raw_" + k, np.nan)
+
+    raw["trim_drop_rate"] = 0.0
+    raw["trim_lo"] = np.nan
+    raw["trim_hi"] = np.nan
+
+    trim = {}
+    trim["train_time_sec"] = row_dict.get("train_time_sec", np.nan)
+    trim["pred_time_sec"]  = row_dict.get("pred_time_sec", np.nan)
+    for k in ["auc","logloss","brier","ece","ps_mean","ps_p99_p01"]:
+        trim[k] = row_dict.get(k, np.nan)
+
+    trim["overlap_p_lt_0_01"] = row_dict.get("trim_overlap_p_lt_0_01", np.nan)
+    trim["overlap_p_gt_0_99"] = row_dict.get("trim_overlap_p_gt_0_99", np.nan)
+    trim["overlap_p_p01"]     = row_dict.get("trim_overlap_p_p01", np.nan)
+    trim["overlap_p_p99"]     = row_dict.get("trim_overlap_p_p99", np.nan)
+
+    for k in ["att_ess_control","att_w_p99","att_w_max",
+              "att_num_smd_mean","att_num_smd_p90","att_num_smd_max",
+              "att_cat_smd_mean","att_cat_smd_p90","att_cat_smd_max"]:
+        trim[k] = row_dict.get("trim_" + k, np.nan)
+
+    trim["trim_drop_rate"] = row_dict.get("trim_drop_rate", np.nan)
+    trim["trim_lo"] = row_dict.get("trim_lo", np.nan)
+    trim["trim_hi"] = row_dict.get("trim_hi", np.nan)
+
+    df = pd.DataFrame([raw, trim], index=["raw", "trim"])
+    return df[cols]
+
+plot_df = build_raw_trim_plot_df(row)
+plot_df.to_csv(f"{out_dir}/plot_table_raw_vs_trim.csv", index=True)
+print("saved:", f"{out_dir}/plot_table_raw_vs_trim.csv")
+plot_df
+#### 8.5 画三块面板图（panel1/panel2/panel3）
+# =========================
+# Step8.5.: panel plots (raw vs trim)
+# =========================
+def plot_one_metric(ax, df, col):
+    df[col].plot(kind="bar", ax=ax, color=["#4C78A8", "#F58518"])
+    ax.set_title(col, fontsize=11)
+    ax.grid(axis="y", linestyle="--", alpha=0.25)
+    ax.set_xlabel("")
+    ax.tick_params(axis="x", rotation=0)
+
+    vals = df[col].values
+    lo, hi = auto_ylim(vals)
+    ax.set_ylim(lo, hi)
+
+    if col in ["auc"]:
+        annotate_bars_vertical(ax, fmt="percent", pct_decimals=2)
+    elif col.startswith("overlap_") or col == "trim_drop_rate":
+        annotate_bars_vertical(ax, fmt="percent", pct_decimals=2)
+    elif col.endswith("_sec"):
+        annotate_bars_vertical(ax, fmt="value", value_decimals=1)
+    elif ("smd" in col) or ("logloss" in col) or ("brier" in col) or ("ece" in col) or ("ps_" in col) or ("att_" in col):
+        annotate_bars_vertical(ax, fmt="value", value_decimals=3)
+    else:
+        annotate_bars_vertical(ax, fmt="auto", value_decimals=3, pct_decimals=2)
+
+def plot_panel(panel_name, df, cols, ncols=4, col_w=4.2, row_h=3.6, dpi=160):
+    cols = [c for c in cols if c in df.columns]
+    if len(cols) == 0:
+        print(f"[skip] {panel_name}: no columns")
+        return
+
+    n = len(cols)
+    nrows = math.ceil(n / ncols)
+
+    fig_w = col_w * ncols
+    fig_h = row_h * nrows
+    fig, axes = plt.subplots(nrows, ncols, figsize=(fig_w, fig_h), dpi=dpi)
+    axes = np.array(axes).ravel()
+
+    for i, col in enumerate(cols):
+        plot_one_metric(axes[i], df, col)
+        if "smd" in col:
+            axes[i].axhline(0.1, color="green", linestyle="--", linewidth=1)
+            axes[i].axhline(0.3, color="orange", linestyle="--", linewidth=1)
+
+    for j in range(n, len(axes)):
+        fig.delaxes(axes[j])
+
+    fig.suptitle(panel_name, fontsize=14)
+    fig.subplots_adjust(left=0.05, right=0.99, top=0.88, bottom=0.18, wspace=0.35, hspace=0.55)
+
+    out_path = f"{out_dir}/{panel_name}.png"
+    fig.savefig(out_path, bbox_inches="tight", dpi=200)
+    plt.show()
+    print("saved:", out_path)
+
+panel1 = ["train_time_sec","pred_time_sec","auc","logloss","brier","ece","ps_p99_p01"]
+panel2 = ["trim_drop_rate","overlap_p_lt_0_01","overlap_p_gt_0_99","overlap_p_p01","overlap_p_p99"]
+panel3 = ["att_ess_control","att_w_p99","att_w_max",
+          "att_num_smd_mean","att_num_smd_p90","att_num_smd_max",
+          "att_cat_smd_mean","att_cat_smd_p90","att_cat_smd_max",
+          "trim_lo","trim_hi"]
+
+plot_panel("panel1_pred_calib_raw_vs_trim", plot_df, panel1, ncols=4)
+plot_panel("panel2_overlap_raw_vs_trim", plot_df, panel2, ncols=3)
+plot_panel("panel3_stability_balance_raw_vs_trim", plot_df, panel3, ncols=3)
+#### 8.6 pscore 分布图（raw + trimmed）
+# =========================
+# Step8.6: pscore histograms (raw & trimmed)
+# =========================
+def plot_ps_hist(y, ps, title, path=None, show=True):
+    y = np.asarray(y).astype(int)
+    ps = np.asarray(ps).astype(float)
+
+    dfh = pd.DataFrame({"D": y, "ps": ps})
+    ps0 = dfh[dfh.D==0]["ps"].values
+    ps1 = dfh[dfh.D==1]["ps"].values
+
+    p_lt_001 = float(np.mean(ps < 0.01))
+    p_gt_099 = float(np.mean(ps > 0.99))
+
+    fig, ax = plt.subplots(figsize=(7.2, 4.6))
+    sns.histplot(ps0, bins=40, stat="density", color="steelblue", alpha=0.45,
+                 label=f"control (n={len(ps0)})", ax=ax)
+    sns.histplot(ps1, bins=40, stat="density", color="tomato", alpha=0.55,
+                 label=f"treated (n={len(ps1)})", ax=ax)
+
+    ax.set_title(title)
+    ax.set_xlabel("pscore")
+    ax.set_ylabel("density")
+    ax.grid(axis="y", linestyle="--", alpha=0.25)
+    ax.legend()
+
+    txt_all = (f"treated_rate={np.mean(y):.2%}\n"
+               f"P(ps<0.01)={p_lt_001:.2%}\n"
+               f"P(ps>0.99)={p_gt_099:.2%}\n"
+               f"p01={np.quantile(ps,0.01):.4f}  p99={np.quantile(ps,0.99):.4f}")
+    ax.text(0.02, 0.98, txt_all, transform=ax.transAxes,
+            ha="left", va="top", fontsize=9,
+            bbox=dict(boxstyle="round,pad=0.35", fc="white", ec="gray", alpha=0.9))
+
+    fig.tight_layout()
+    if path is not None:
+        fig.savefig(path, dpi=200)
+        print("saved:", path)
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+y_va = va[D_COL].values.astype(int)
+ps_va_clip = np.clip(ps_va, 1e-6, 1-1e-6)
+
+plot_ps_hist(y_va, ps_va_clip, "pscore distribution (VAL tune-sample) - raw",
+             path=f"{out_dir}/ps_hist_raw.png", show=True)
+
+lo_va, hi_va = float(m["trim_lo"]), float(m["trim_hi"])
+mask_va = (ps_va_clip >= lo_va) & (ps_va_clip <= hi_va)
+
+plot_ps_hist(y_va[mask_va], ps_va_clip[mask_va],
+             f"pscore distribution (VAL tune-sample) - trimmed [{lo_va:.4f},{hi_va:.4f}]",
+             path=f"{out_dir}/ps_hist_trim.png", show=True)
+
+#### 8.7 校准曲线图（reliability diagram）
+# =========================
+# Step8.7: calibration curve (VAL)
+# =========================
+pt, pp = calibration_curve(y_va, ps_va_clip, n_bins=N_BINS_ECE, strategy="quantile")
+cal_df = pd.DataFrame({"prob_true": pt, "prob_pred": pp})
+cal_df.to_csv(f"{out_dir}/calibration_curve_val.csv", index=False)
+print("saved:", f"{out_dir}/calibration_curve_val.csv")
+
+mx = float(max(cal_df["prob_true"].max(), cal_df["prob_pred"].max()))
+fig, ax = plt.subplots(figsize=(6.2, 5.2))
+ax.plot([0, mx], [0, mx], "--", color="gray", linewidth=1, label="perfect (y=x)")
+ax.plot(cal_df["prob_pred"], cal_df["prob_true"], marker="o", linewidth=2, color="#4C78A8", label="CatBoost")
+ax.set_title("Calibration curve (VAL tune-sample, quantile bins)")
+ax.set_xlabel("Mean predicted prob (prob_pred)")
+ax.set_ylabel("Empirical rate (prob_true)")
+ax.grid(True, linestyle="--", alpha=0.3)
+ax.set_xlim(0, mx*1.05)
+ax.set_ylim(0, mx*1.05)
+ax.legend()
+plt.tight_layout()
+plt.savefig(f"{out_dir}/calibration_curve_val.png", dpi=200)
+plt.show()
+print("saved:", f"{out_dir}/calibration_curve_val.png")
+
+#### 8.8 特征的SMD，per-feature |SMD|（raw vs trim）TOP30
+##### 这张图直接回答你想要的“哪些特征最不平衡、为什么 balance 没做得更好”，也能指导你后续：
+生成 per-feature |SMD| series（numeric + cat onehot）
+# =========================
+# Step8.8: per-feature |SMD| TOP30 (raw vs trim)
+# =========================
+D_raw  = va[D_COL].values.astype(int)
+ps_raw = np.clip(np.asarray(ps_va, dtype=float), 1e-6, 1-1e-6)
+w_raw  = ipw_att_weights(D_raw, ps_raw, clip=ATT_CLIP)
+
+lo_va, hi_va = float(m["trim_lo"]), float(m["trim_hi"])
+mask_va = (ps_raw >= lo_va) & (ps_raw <= hi_va)
+
+va_trim   = va.loc[mask_va].copy()
+diag_trim = diag_va.loc[mask_va].copy()
+
+D_trim  = va_trim[D_COL].values.astype(int)
+ps_trim = ps_raw[mask_va]
+w_trim  = ipw_att_weights(D_trim, ps_trim, clip=ATT_CLIP)
+
+print("raw n:", len(va), "trim n:", len(va_trim), "drop:", f"{1-len(va_trim)/len(va):.2%}")
+print("trim treated n:", int(D_trim.sum()), "control n:", int((D_trim==0).sum()))
+
+def per_feature_abs_smd_numeric(df, num_cols, D_col, w):
+    D = df[D_col].values.astype(int)
+    out = {}
+    for c in num_cols:
+        x = pd.to_numeric(df[c], errors="coerce").values
+        x = np.nan_to_num(x, nan=np.nanmedian(x))
+        out[c] = abs(smd_weighted(x, D, w))
+    return pd.Series(out).sort_values(ascending=False)
+
+def per_feature_abs_smd_diag_onehot(diag_oh_df, D, w):
+    D = np.asarray(D).astype(int)
+    out = {}
+    for c in diag_oh_df.columns:
+        x = diag_oh_df[c].values.astype(float)
+        out[c] = abs(smd_weighted(x, D, w))
+    return pd.Series(out).sort_values(ascending=False)
+
+smd_num_raw  = per_feature_abs_smd_numeric(va,      balance_num_cols, D_COL, w_raw)
+smd_num_trim = per_feature_abs_smd_numeric(va_trim, balance_num_cols, D_COL, w_trim)
+
+smd_cat_raw  = per_feature_abs_smd_diag_onehot(diag_va,   D_raw,  w_raw)
+smd_cat_trim = per_feature_abs_smd_diag_onehot(diag_trim, D_trim, w_trim)
+
+print("numeric smd series:", smd_num_raw.shape, smd_num_trim.shape)
+print("cat diag smd series:", smd_cat_raw.shape, smd_cat_trim.shape)
+
+def plot_smd_topk_raw_vs_trim(
+    smd_raw, smd_trim, topk=30, title="",
+    out_path=None, good=0.1, upper=0.3,
+    decimals=3, figsize_w=12
+):
+    dfp = pd.DataFrame({"raw": smd_raw, "trim": smd_trim}).fillna(0.0)[["raw","trim"]]
+    dfp["max_"] = dfp.max(axis=1)
+    dfp = dfp.sort_values("max_", ascending=False).head(topk).drop(columns=["max_"])
+    dfp = dfp.iloc[::-1]
+
+    fig_h = max(5, 0.35*len(dfp) + 1.2)
+    ax = dfp.plot(kind="barh", figsize=(figsize_w, fig_h), width=0.85,
+                  color=["#4C78A8", "#F58518"])
+
+    ax.axvline(good,  color="green",  linestyle="--", linewidth=1, label=f"{good} (good)")
+    ax.axvline(upper, color="orange", linestyle="--", linewidth=1, label=f"{upper} (upper)")
+
+    ax.set_title(title)
+    ax.set_xlabel("|SMD| (ATT weighted)")
+    ax.set_ylabel("")
+    ax.grid(axis="x", linestyle="--", alpha=0.3)
+
+    for p in ax.patches:
+        w = p.get_width()
+        if np.isnan(w):
+            continue
+        y = p.get_y() + p.get_height()/2
+        ax.annotate(f"{w:.{decimals}f}", (w, y),
+                    xytext=(3, 0), textcoords="offset points",
+                    ha="left", va="center", fontsize=8)
+
+    ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), frameon=True)
+    plt.tight_layout()
+    if out_path:
+        plt.savefig(out_path, dpi=200, bbox_inches="tight")
+        print("saved:", out_path)
+    plt.show()
+
+topk = 30
+plot_smd_topk_raw_vs_trim(
+    smd_num_raw, smd_num_trim, topk=topk,
+    title=f"Top-{topk} numeric |SMD| (ATT weighted): raw vs trim (VAL tune-sample)",
+    out_path=f"{out_dir}/smd_numeric_top{topk}_raw_vs_trim.png",
+    figsize_w=11
+)
+plot_smd_topk_raw_vs_trim(
+    smd_cat_raw, smd_cat_trim, topk=topk,
+    title=f"Top-{topk} cat(onehot diag) |SMD| (ATT weighted): raw vs trim (VAL tune-sample)",
+    out_path=f"{out_dir}/smd_catdiag_top{topk}_raw_vs_trim.png",
+    figsize_w=13
+)
+
+df_cat_top30 = pd.DataFrame({"raw": smd_cat_raw, "trim": smd_cat_trim}).fillna(0.0)
+df_cat_top30["max_"] = df_cat_top30.max(axis=1)
+df_cat_top30 = df_cat_top30.sort_values("max_", ascending=False).head(30)
+df_cat_top30.to_csv(f"{out_dir}/smd_catdiag_top30_raw_vs_trim.csv", index=True, encoding="utf-8-sig")
+print("saved:", f"{out_dir}/smd_catdiag_top30_raw_vs_trim.csv")
+
+#### 8.9 SHAP “分面条形图”（每个特征贡献）
+# =========================
+# Step8.9: SHAP (CatBoost) - mean(|SHAP|)
+# =========================
+import shap
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+def shap_mean_abs_catboost(model, X, positive_class=1):
+    expl = shap.TreeExplainer(model, feature_perturbation="tree_path_dependent")
+    sv = expl.shap_values(X)
+
+    if isinstance(sv, (list, tuple)):
+        vals = sv[positive_class]
+    else:
+        vals = sv
+    vals = np.asarray(vals)
+    if vals.ndim == 3:
+        vals = vals[:, :, positive_class]
+    return pd.Series(np.mean(np.abs(vals), axis=0), index=X.columns).sort_values(ascending=False)
+
+def plot_shap_barh(shap_series, topn=20, title="CatBoost SHAP", out_path=None):
+    s = shap_series.head(topn).iloc[::-1]
+    fig_h = max(5, 0.35*len(s) + 1.2)
+    fig, ax = plt.subplots(figsize=(11, fig_h))
+    ax.barh(s.index, s.values, color="#4C78A8", alpha=0.9)
+    ax.set_title(title)
+    ax.set_xlabel("mean(|SHAP|)")
+    ax.grid(axis="x", linestyle="--", alpha=0.3)
+
+    for i, v in enumerate(s.values):
+        ax.annotate(f"{v:.3f}", (v, i), xytext=(4,0), textcoords="offset points",
+                    ha="left", va="center", fontsize=9)
+
+    plt.tight_layout()
+    if out_path:
+        plt.savefig(out_path, dpi=200, bbox_inches="tight")
+        print("saved:", out_path)
+    plt.show()
+
+# 用 VAL trimmed 的人群算 SHAP（更贴近最终分析样本）
+X_shap = va.loc[mask_va, feature_cols].copy()
+X_shap = X_shap.iloc[:min(3000, len(X_shap))].copy()
+
+shap_imp = shap_mean_abs_catboost(cat_model, X_shap, positive_class=1)
+shap_imp.head(200).reset_index().to_csv(
+    f"{out_dir}/shap_mean_abs_top200.csv",
+    index=False, header=["feature","mean_abs_shap"]
+)
+print("saved:", f"{out_dir}/shap_mean_abs_top200.csv")
+
+plot_shap_barh(
+    shap_imp, topn=25,
+    title="CatBoost SHAP (VAL trimmed, mean(|SHAP|))",
+    out_path=f"{out_dir}/shap_barh_top25.png"
+)
+### Step9：PS模型全量重训 + 导出 3 件套（落盘给到notebook3）
+import os, json, gc
+import numpy as np
+import pandas as pd
+from catboost import CatBoostClassifier, Pool
+
+# ===== paths =====
+OUT_DIR = "/ossfs/node_65164273/workspace/causal_out_userdid"
+FEATURE_VERSION = "user_full_v1"
+PS_DIR = f"{OUT_DIR}/ps_userdid_{FEATURE_VERSION}"
+os.makedirs(PS_DIR, exist_ok=True)
+
+PANEL_PATH = f"{OUT_DIR}/panel_fe.parquet"
+PRE_PATH   = f"{OUT_DIR}/user_pre_fe.parquet"
+FEAT_PATH  = f"{OUT_DIR}/feature_cols_user.json"
+
+USER_ID="user_id"
+POST="post"
+D="group_u"
+PS_COL="pscore_u"
+
+RANDOM_STATE = 2026
+
+# ===== load feature cols =====
+feature_cols = json.load(open(FEAT_PATH, "r"))
+
+# ===== load user_pre (full) =====
+user_pre = pd.read_parquet(PRE_PATH, columns=[USER_ID, D] + feature_cols)
+user_pre[USER_ID] = user_pre[USER_ID].astype(str)
+user_pre[D] = pd.to_numeric(user_pre[D], errors="coerce").fillna(0).astype(int)
+
+# cat features index for catboost
+X_all = user_pre[feature_cols]
+cat_cols = X_all.select_dtypes(include=["object","string","category"]).columns.tolist()
+cat_idx = [feature_cols.index(c) for c in cat_cols] if len(cat_cols)>0 else None
+
+y_all = user_pre[D].values.astype(int)
+pool_all = Pool(X_all, y_all, cat_features=cat_idx)
+
+# ===== common support bounds =====
+def get_trim_bounds_common_support(ps, d, q_low=0.01, q_high=0.99):
+    ps = np.asarray(ps, float)
+    d  = np.asarray(d, int)
+    ps_t = ps[d==1]; ps_c = ps[d==0]
+    lo = max(np.quantile(ps_t, q_low),  np.quantile(ps_c, q_low))
+    hi = min(np.quantile(ps_t, q_high), np.quantile(ps_c, q_high))
+    return float(lo), float(hi)
+
+# ===== training base (full) =====
+CAT_BASE_FULL = dict(
+    loss_function="Logloss",
+    eval_metric="AUC",
+    iterations=900,                 # 先跑通；不够再加到1100/1200
+    random_seed=RANDOM_STATE,
+    verbose=200,
+    allow_writing_files=False,
+    thread_count=-1,
+    one_hot_max_size=20,
+    max_ctr_complexity=1,
+    ctr_leaf_count_limit=1000,
+    model_size_reg=5.0,
+)
+
+# ===== fit final model =====
+assert "best_params" in globals(), "best_params not found. Run Step8.1 and create best_params first."
+final_model = CatBoostClassifier(**CAT_BASE_FULL, **best_params)
+final_model.fit(pool_all)
+
+ps_u = np.clip(final_model.predict_proba(X_all)[:,1], 1e-6, 1-1e-6)
+lo, hi = get_trim_bounds_common_support(ps_u, y_all, q_low=0.01, q_high=0.99)
+
+ps_tbl = user_pre[[USER_ID]].copy()
+ps_tbl[PS_COL] = ps_u
+ps_tbl["in_overlap_u"] = (ps_tbl[PS_COL] >= lo) & (ps_tbl[PS_COL] <= hi)
+
+ps_path = f"{PS_DIR}/ps_user.parquet"
+ps_tbl.to_parquet(ps_path, index=False, engine="pyarrow")
+print("saved:", ps_path, "trim_drop_rate:", float(1.0-ps_tbl["in_overlap_u"].mean()))
+
+# ===== save meta for NB3 =====
+meta = dict(
+    feature_version=FEATURE_VERSION,
+    feature_cols=feature_cols,
+    cat_cols=cat_cols,
+    best_params=best_params,
+    cat_base_full=CAT_BASE_FULL,
+    trim_q_low=0.01, trim_q_high=0.99,
+    trim_lo=float(lo), trim_hi=float(hi),
+    trim_drop_rate=float(1.0-ps_tbl["in_overlap_u"].mean()),
+)
+meta_path = f"{PS_DIR}/best_meta.json"
+json.dump(meta, open(meta_path, "w"), ensure_ascii=False, indent=2)
+print("saved:", meta_path)
+
+# ===== merge to panel_with_ps (NB3 input) =====
+# DR 要用特征：把 feature_cols 一并读出来
+panel_need_cols = [
+    USER_ID, POST, D,
+    "num_smart","den_smart","num_robot","den_robot","num_reco","den_reco","num_enter_man","den_enter_man",
+    "strategy_id","strategy_name","eval_id","eval_dt","t0","window_days","scene_codes_raw","whitelist_uids_raw","has_whitelist",
+] + feature_cols
+
+panel = pd.read_parquet(PANEL_PATH, columns=list(dict.fromkeys(panel_need_cols)))
+panel[USER_ID] = panel[USER_ID].astype(str)
+
+panel_ps = panel.merge(ps_tbl, on=USER_ID, how="left")
+assert panel_ps[PS_COL].notna().all()
+
+panel_ps_path = f"{PS_DIR}/panel_with_ps.parquet"
+panel_ps.to_parquet(panel_ps_path, index=False, engine="pyarrow")
+print("saved:", panel_ps_path, "shape:", panel_ps.shape)
+
+# ===== cleanup =====
+del panel, panel_ps, pool_all, X_all, y_all, final_model
+gc.collect()
+print("[User Step9] cleanup done.")
+D = va["group_u"].values.astype(int)
+ps = np.clip(ps_va, 1e-6, 1-1e-6)
+w = np.where(D==1, 1.0, ps/(1-ps))
+print("w summary:", np.quantile(w, [0, .5, .9, .95, .99, 1]))
+print("control w mean:", w[D==0].mean(), "treated w mean:", w[D==1].mean())
+#### 9.1 验证文件是否产出
+import os
+print(os.path.exists(f"{PS_DIR}/ps_user.parquet"))
+print(os.path.exists(f"{PS_DIR}/panel_with_ps.parquet"))
+print(os.path.exists(f"{PS_DIR}/best_meta.json"))
+### Step9：PS模型全量重训 + 导出 3 件套（落盘给到notebook3）[ROBUST VERSION]
+import os, json, gc
+import numpy as np
+import pandas as pd
+from catboost import CatBoostClassifier, Pool
+
+# ===== paths =====
+OUT_DIR = "/ossfs/node_65164273/workspace/causal_out_userdid"
+FEATURE_VERSION = "user_full_v1"
+PS_DIR = f"{OUT_DIR}/ps_userdid_{FEATURE_VERSION}"
+os.makedirs(PS_DIR, exist_ok=True)
+
+PANEL_PATH = f"{OUT_DIR}/panel_fe.parquet"      # NB1 落盘产物（特征工程后的 panel）
+PRE_PATH   = f"{OUT_DIR}/user_pre_fe.parquet"   # NB1 落盘产物（post=0 一行/人）
+FEAT_PATH  = f"{OUT_DIR}/feature_cols_user.json"
+
+USER_ID="user_id"
+POST="post"
+D="group_u"
+PS_COL="pscore_u"
+
+RANDOM_STATE = 2026
+
+# ===== load feature cols =====
+feature_cols = json.load(open(FEAT_PATH, "r"))
+print("[Step9] feature cols:", len(feature_cols))
+
+# ===== load user_pre (full) =====
+user_pre = pd.read_parquet(PRE_PATH, columns=[USER_ID, D] + feature_cols)
+user_pre[USER_ID] = user_pre[USER_ID].astype(str)
+user_pre[D] = pd.to_numeric(user_pre[D], errors="coerce").fillna(0).astype(int)
+
+# cat features index for catboost
+X_all = user_pre[feature_cols]
+cat_cols = X_all.select_dtypes(include=["object","string","category"]).columns.tolist()
+cat_idx = [feature_cols.index(c) for c in cat_cols] if len(cat_cols)>0 else None
+
+y_all = user_pre[D].values.astype(int)
+pool_all = Pool(X_all, y_all, cat_features=cat_idx)
+
+# ===== common support bounds =====
+def get_trim_bounds_common_support(ps, d, q_low=0.01, q_high=0.99):
+    ps = np.asarray(ps, float)
+    d  = np.asarray(d, int)
+    ps_t = ps[d==1]; ps_c = ps[d==0]
+    lo = max(np.quantile(ps_t, q_low),  np.quantile(ps_c, q_low))
+    hi = min(np.quantile(ps_t, q_high), np.quantile(ps_c, q_high))
+    return float(lo), float(hi)
+
+# ===== training base (full) =====
+CAT_BASE_FULL = dict(
+    loss_function="Logloss",
+    eval_metric="AUC",
+    iterations=900,
+    random_seed=RANDOM_STATE,
+    verbose=200,
+    allow_writing_files=False,
+    thread_count=-1,
+    one_hot_max_size=20,
+    max_ctr_complexity=1,
+    ctr_leaf_count_limit=1000,
+    model_size_reg=5.0,
+)
+
+# ===== fit final model =====
+assert "best_params" in globals(), "best_params not found. Run Step8 and create best_params first."
+final_model = CatBoostClassifier(**CAT_BASE_FULL, **best_params)
+final_model.fit(pool_all)
+
+ps_u = np.clip(final_model.predict_proba(X_all)[:,1], 1e-6, 1-1e-6)
+lo, hi = get_trim_bounds_common_support(ps_u, y_all, q_low=0.01, q_high=0.99)
+
+ps_tbl = user_pre[[USER_ID]].copy()
+ps_tbl[PS_COL] = ps_u
+ps_tbl["in_overlap_u"] = (ps_tbl[PS_COL] >= lo) & (ps_tbl[PS_COL] <= hi)
+
+ps_path = f"{PS_DIR}/ps_user.parquet"
+ps_tbl.to_parquet(ps_path, index=False, engine="pyarrow")
+print("saved:", ps_path, "trim_drop_rate:", float(1.0-ps_tbl["in_overlap_u"].mean()))
+
+# ===== save meta for NB3 =====
+meta = dict(
+    feature_version=FEATURE_VERSION,
+    feature_cols=feature_cols,
+    cat_cols=cat_cols,
+    best_params=best_params,
+    cat_base_full=CAT_BASE_FULL,
+    trim_q_low=0.01, trim_q_high=0.99,
+    trim_lo=float(lo), trim_hi=float(hi),
+    trim_drop_rate=float(1.0-ps_tbl["in_overlap_u"].mean()),
+    att_clip=50.0,
+)
+meta_path = f"{PS_DIR}/best_meta.json"
+json.dump(meta, open(meta_path, "w"), ensure_ascii=False, indent=2)
+print("saved:", meta_path)
+
+# ===== merge to panel_with_ps (NB3 input) =====
+# 关键：panel_with_ps 必须包含 feature_cols，否则 NB3 DR / build_line_df 会 KeyError
+# 这里做“按文件实际列”读取，避免 columns 缺失直接炸
+panel_all_cols = pd.read_parquet(PANEL_PATH, engine="pyarrow").columns.tolist()
+
+base_need = [
+    USER_ID, POST, D,
+    "num_smart","den_smart","num_robot","den_robot","num_reco","den_reco","num_enter_man","den_enter_man",
+    "router_cnt",
+    # meta（有就读；没有不会强行读）
+    "strategy_id","strategy_name","eval_id","eval_dt","t0","window_days","scene_codes_raw","whitelist_uids_raw","has_whitelist",
+]
+
+panel_need_cols = list(dict.fromkeys(base_need + feature_cols))
+panel_need_cols = [c for c in panel_need_cols if c in panel_all_cols]
+
+missing_in_panel = [c for c in feature_cols if c not in panel_all_cols]
+print("[Step9] panel has cols:", len(panel_all_cols))
+print("[Step9] read panel cols:", len(panel_need_cols))
+print("[Step9] missing feature cols in panel_fe.parquet:", len(missing_in_panel))
+if missing_in_panel:
+    print("missing examples:", missing_in_panel[:30])
+
+panel = pd.read_parquet(PANEL_PATH, columns=panel_need_cols)
+panel[USER_ID] = panel[USER_ID].astype(str)
+
+panel_ps = panel.merge(ps_tbl, on=USER_ID, how="left")
+assert panel_ps[PS_COL].notna().all(), "Some users missing pscore after merge"
+
+panel_ps_path = f"{PS_DIR}/panel_with_ps.parquet"
+panel_ps.to_parquet(panel_ps_path, index=False, engine="pyarrow")
+print("saved:", panel_ps_path, "shape:", panel_ps.shape)
+
+# ===== cleanup =====
+del panel, panel_ps, pool_all, X_all, y_all, final_model, user_pre
+gc.collect()
+print("[NB2 Step9] cleanup done.")
